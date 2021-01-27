@@ -6,7 +6,7 @@ uses
   {$IFDEF ANDROID}
   FMX.PhoneDialer,
   {$ENDIF}
-  FMX.BASS, FMX.BASS.AAC, System.Classes;
+  FMX.Types, FMX.BASS, FMX.BASS.AAC, FMX.BASS.Plugins, System.Classes;
 
 type
   TFFTData = array[0..512] of Single;
@@ -16,6 +16,8 @@ type
   TPlayerPlayKind = (pkFile, pkStream);
 
   TPlayAsyncResult = reference to procedure(const Success: Boolean);
+
+  TOnChangePosition = procedure(Sender: TObject; const Time: Int64) of object;
 
   TFMXCustomPlayer = class abstract(TComponent)
   protected
@@ -41,9 +43,15 @@ type
     FPauseOnIncomingCalls: Boolean;
     FPlayerState: TPlayerState;
     FPlayKind: TPlayerPlayKind;
-    FPlaySync: HSYNC;
+    FPlaySyncEnd: HSYNC;
     FStreamURL: string;
     FVolumeChannel: Single;
+    FPlugins: TFMXPlayerPlugins;
+    FStarting: Boolean;
+    FUseDefaultDevice: Boolean;
+    FTimer: TTimer;
+    FOnChangePosition: TOnChangePosition;
+    FPositionInterval: Integer;
     function GetBufferring: Int64;
     function GetBufferringPercent: Extended;
     function GetIsActiveChannel: Boolean;
@@ -80,7 +88,12 @@ type
     procedure SetSystemVolume(const AValue: Single);
     procedure SetVolumeChannel(const Value: Single);
     procedure UnloadChannel;
+    procedure SetPlugins(const Value: TFMXPlayerPlugins);
+    procedure SetUseDefaultDevice(const Value: Boolean);
+    procedure SetOnChangePosition(const Value: TOnChangePosition);
+    procedure SetPositionInterval(const Value: Integer);
   protected
+    procedure FOnTimer(Sender: TObject);
     procedure SetFileName(const Value: string); virtual;
     procedure SetStreamURL(AUrl: string); virtual;
     property IsActiveChannel: Boolean read GetIsActiveChannel;
@@ -96,11 +109,13 @@ type
     /// Use Handle (for android, fmx) or WindowHandle (windows, fmx/vcl) or nothing
     /// </summary>
     function Init(Handle: Pointer = nil; HWND: NativeUInt = 0): Boolean; overload; virtual;
+    procedure Uninit; virtual;
     function Play: Boolean; virtual;
     function Resume: Boolean; virtual;
     procedure Pause; virtual;
     procedure PlayAsync(ResultMethod: TPlayAsyncResult = nil); virtual;
     procedure Stop; virtual;
+    procedure SwitchPlay;
     //Props
     property Async: Boolean read FAsync write SetAsync;
     property AutoInit: Boolean read FAutoInit write SetAutoInit;
@@ -132,47 +147,13 @@ type
     property SystemVolume: Single read GetSystemVolume write SetSystemVolume;
     property Version: string read GetVersion;
     property VolumeChannel: Single read FVolumeChannel write SetVolumeChannel;
+    property UseDefaultDevice: Boolean read FUseDefaultDevice write SetUseDefaultDevice;
+    property PositionInterval: Integer read FPositionInterval write SetPositionInterval;
     //Events
     property OnChangeState: TNotifyEvent read FOnChangeState write SetOnChangeState;
     property OnEnd: TNotifyEvent read FOnEnd write SetOnEnd;
-  end;
-
-  [ComponentPlatformsAttribute(pidWin32 or pidWin64 or pidAndroid32Arm or pidAndroid64Arm)]
-  TFMXPlayer = class(TFMXCustomPlayer)
-  public
-    property Bufferring;
-    property BufferringPercent;
-    property IsInit;
-    property IsOpening;
-    property IsPause;
-    property IsPlay;
-    property LastErrorCode;
-    property Position;
-    property PositionByte;
-    property PositionPercent;
-    property PositionTime;
-    property PositionTimeLeft;
-    property Size;
-    property SizeAsBuffer;
-    property SizeByte;
-    property State;
-    property VolumeChannel;
-  published
-    //Props
-    property Async default False;
-    property AutoInit default False;
-    property Autoplay default False;
-    property Device default -1;
-    property FileName;
-    property Flags default 0;
-    property Freq default 44100;
-    property KeepPlayChannel default False;
-    property PauseOnIncomingCalls default False;
-    property StreamURL;
-    property Version;
-    //Events
-    property OnChangeState;
-    property OnEnd;
+    property OnChangePosition: TOnChangePosition read FOnChangePosition write SetOnChangePosition;
+    property Plugins: TFMXPlayerPlugins read FPlugins write SetPlugins;
   end;
 
 var
@@ -181,17 +162,18 @@ var
 implementation
 
 uses
+  FMX.platform,
   {$IFDEF MSWINDOWS}
   Winapi.Windows,
   {$ENDIF}
   {$IFDEF ANDROID}
   FMX.Platform.Android, Androidapi.JNI.Os, Androidapi.JNI.Net, Androidapi.JNIBridge, Androidapi.JNI.JavaTypes,
   Androidapi.JNI.GraphicsContentViewText, Androidapi.JNI.Media, Androidapi.JNI.Provider, Androidapi.Helpers,
-  Androidapi.JNI.App, FMX.Platform,
+  Androidapi.JNI.App,
   {$ENDIF}
   System.Math, System.SysUtils;
 
-procedure FSync(handle: HSYNC; channel, data: Cardinal; user: Pointer);
+procedure FSyncEnd(handle: HSYNC; channel, data: Cardinal; user: Pointer);
 begin
   if Assigned(Player) then
     Player.DoOnEnd(handle, channel, data, user);
@@ -202,8 +184,7 @@ end;
 {$IFDEF ANDROID}
 procedure TFMXCustomPlayer.DetectIsCallStateChanged(const ACallID: string; const ACallState: TCallState);
 begin
-  case ACallState of
-    //TCallState.None:
+  case ACallState of    //TCallState.None:
 		//TCallState.Connected:
 		//TCallState.Dialing:
 		//TCallState.Disconnected:
@@ -222,6 +203,13 @@ constructor TFMXCustomPlayer.Create(AOwner: TComponent);
 begin
   inherited;
   Player := Self;
+  FPositionInterval := 1000;
+  FTimer := TTimer.Create(Self);
+  FTimer.Enabled := False;
+  FTimer.Interval := FPositionInterval;
+  FTimer.OnTimer := FOnTimer;
+  FUseDefaultDevice := True;
+  FStarting := False;
   FKeepPlayChannel := False;
   FDevice := -1;
   FFreq := 44100;
@@ -229,6 +217,7 @@ begin
   FActiveChannel := 0;
   FVolumeChannel := 100;
   FPlayerState := TPlayerState.psNone;
+  FPlugins := TFMXPlayerPlugins.Create;
 end;
 
 function TFMXCustomPlayer.GetSystemVolume: Single;
@@ -253,6 +242,8 @@ var
   AudioManager: JAudioManager;
 {$ENDIF}
 begin
+  if csDesigning in ComponentState then
+    Exit;
 {$IFDEF ANDROID}
   AudioManager := TJAudioManager.Wrap(MainActivity.getSystemService(TJContext.JavaClass.AUDIO_SERVICE));
   AudioManager.SetStreamVolume(TJAudioManager.JavaClass.STREAM_MUSIC, Round(AudioManager.getStreamMaxVolume(TJAudioManager.JavaClass.STREAM_MUSIC)
@@ -261,6 +252,11 @@ begin
 {$IFDEF MSWINDOWS}
   BASS_SetVolume(AValue);
 {$ENDIF}
+end;
+
+procedure TFMXCustomPlayer.SetUseDefaultDevice(const Value: Boolean);
+begin
+  FUseDefaultDevice := Value;
 end;
 
 procedure TFMXCustomPlayer.DoOnEnd(handle: HSYNC; channel, data: Cardinal; user: Pointer);
@@ -280,8 +276,19 @@ begin
   DoChangeState;
 end;
 
+procedure TFMXCustomPlayer.FOnTimer(Sender: TObject);
+begin
+  if IsPlay then
+  begin
+    if Assigned(FOnChangePosition) then
+      FOnChangePosition(Self, GetPosition);
+  end;
+end;
+
 procedure TFMXCustomPlayer.FUpdateChannelVolume;
 begin
+  if csDesigning in ComponentState then
+    Exit;
   if IsActiveChannel then
   begin
     BASS_ChannelSetAttribute(FActiveChannel, BASS_ATTRIB_VOL, FVolumeChannel / 100);
@@ -314,7 +321,7 @@ begin
         FUpdateChannelVolume;
         if BASS_ChannelPlay(FActiveChannel, False) then
         begin
-          FPlaySync := BASS_ChannelSetSync(FActiveChannel, BASS_SYNC_END, 0, @FSync, nil);
+          FPlaySyncEnd := BASS_ChannelSetSync(FActiveChannel, BASS_SYNC_END, 0, @FSyncEnd, nil);
           DoPlayerState(TPlayerState.psPlay);
           Result := True;
         end;
@@ -338,6 +345,9 @@ begin
     var
       Success: Boolean;
     begin
+      while FStarting do
+        Sleep(100);
+      FStarting := True;
       try
         Success := Play;
         if Assigned(ResultMethod) then
@@ -348,14 +358,21 @@ begin
             end);
       except
       end;
+      FStarting := False;
     end).Start;
+end;
+
+procedure TFMXCustomPlayer.Uninit;
+begin
+  if BASS_Available and FIsInit then
+    BASS_Free;
 end;
 
 procedure TFMXCustomPlayer.UnloadChannel;
 begin
   if IsActiveChannel then
   begin
-    BASS_ChannelRemoveSync(FActiveChannel, FPlaySync);
+    BASS_ChannelRemoveSync(FActiveChannel, FPlaySyncEnd);
     BASS_StreamFree(FActiveChannel);
   end;
 end;
@@ -379,6 +396,11 @@ begin
   FPlayerState := Value;
 end;
 
+procedure TFMXCustomPlayer.SetPlugins(const Value: TFMXPlayerPlugins);
+begin
+  FPlugins := Value;
+end;
+
 procedure TFMXCustomPlayer.SetPosition(const Value: Int64);
 begin
   if IsActiveChannel then
@@ -391,6 +413,12 @@ begin
     BASS_ChannelSetPosition(FActiveChannel, Value, BASS_POS_BYTE);
 end;
 
+procedure TFMXCustomPlayer.SetPositionInterval(const Value: Integer);
+begin
+  FPositionInterval := Value;
+  FTimer.Interval := FPositionInterval;
+end;
+
 procedure TFMXCustomPlayer.SetPositionPercent(const Value: Extended);
 begin
   SetPosition(Round((GetSize / 100) * Value));
@@ -398,28 +426,49 @@ end;
 
 procedure TFMXCustomPlayer.SetStreamURL(AUrl: string);
 begin
-  if AUrl.IsEmpty then
+  if csDesigning in ComponentState then
+  begin
+    FPlayKind := TPlayerPlayKind.pkStream;
+    FStreamURL := AUrl;
     Exit;
-  FStreamURL := AUrl;
-  FPlayKind := TPlayerPlayKind.pkStream;
+  end;
 
-  if not (csDesigning in ComponentState) then
-    if FAutoplay then
-      if FAsync then
-        PlayAsync(
-          procedure(const Success: Boolean)
+  if IsOpening then
+    Exit;
+
+  if AUrl.IsEmpty then
+  begin
+    FStreamURL := AUrl;
+    Stop;
+    Exit;
+  end;
+
+  if FStreamURL = AUrl then
+  begin
+    if (FAutoplay and (not IsPlay)) then
+      Play;
+    Exit;
+  end;
+
+  FPlayKind := TPlayerPlayKind.pkStream;
+  FStreamURL := AUrl;
+
+  if FAutoplay then
+    if FAsync then
+      PlayAsync(
+        procedure(const Success: Boolean)
+        begin
+          if not Success then
           begin
-            if not Success then
-            begin
-              Sleep(100);
-              PlayAsync;
-            end;
-          end)
-      else if not Play then
-      begin
-        Sleep(100);
-        Play;
-      end;
+            Sleep(100);
+            PlayAsync;
+          end;
+        end)
+    else if not Play then
+    begin
+      Sleep(100);
+      Play;
+    end;
 end;
 
 procedure TFMXCustomPlayer.SetAsync(const Value: Boolean);
@@ -484,6 +533,16 @@ begin
   if IsActiveChannel then
     BASS_ChannelStop(FActiveChannel);
   DoPlayerState(TPlayerState.psStop);
+end;
+
+procedure TFMXCustomPlayer.SwitchPlay;
+begin
+  if IsPlay then
+    Pause
+  else if IsPause then
+    Resume
+  else
+    Play;
 end;
 
 function TFMXCustomPlayer.GetBufferring: Int64;
@@ -599,6 +658,8 @@ begin
   Result := False;
   if BASS_Available then
   begin
+    if FUseDefaultDevice then
+      BASS_SetConfig(BASS_CONFIG_DEV_DEFAULT, 1);
     {$IFDEF MSWINDOWS}
     if BASS_Init(Device, Freq, Flags, HWND, nil) then
     {$ENDIF}
@@ -606,7 +667,7 @@ begin
       if BASS_Init(Device, Freq, Flags, Handle, nil) then
     {$ENDIF}
       begin
-        BASS_PluginLoad(PChar(BASS_AAC_Lib), 0 or BASS_UNICODE);
+        FPlugins.Load;
         BASS_SetConfig(BASS_CONFIG_NET_PLAYLIST, 1);
         BASS_SetConfig(BASS_CONFIG_NET_PREBUF, 0);
         Result := True;
@@ -637,7 +698,13 @@ end;
 
 destructor TFMXCustomPlayer.Destroy;
 begin
-  UnloadChannel;
+  if not (csDesigning in ComponentState) then
+  begin
+    UnloadChannel;
+    FPlugins.Unload;
+    Uninit;
+  end;
+  FPlugins.Free;
   inherited;
 end;
 
@@ -660,6 +727,7 @@ begin
     TThread.ForceQueue(nil,
       procedure
       begin
+        FTimer.Enabled := FPlayerState in [TPlayerState.psPlay, TPlayerState.psOpening];
         FOnChangeState(Self);
       end);
 end;
@@ -676,6 +744,11 @@ begin
     DoPlayerState(TPlayerState.psError);
     Result := False;
   end;
+end;
+
+procedure TFMXCustomPlayer.SetOnChangePosition(const Value: TOnChangePosition);
+begin
+  FOnChangePosition := Value;
 end;
 
 procedure TFMXCustomPlayer.SetOnChangeState(const Value: TNotifyEvent);
