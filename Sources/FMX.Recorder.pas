@@ -3,7 +3,8 @@ unit FMX.Recorder;
 interface
 
 uses
-  System.SysUtils, System.Types, System.UITypes, System.Classes, System.Variants, FMX.BASS, System.Generics.Collections;
+  System.SysUtils, System.Types, System.UITypes, System.Classes, System.Variants, FMX.BASS.Classes, FMX.BASS,
+  System.Generics.Collections;
 
 type
   TInputDevice = record
@@ -15,7 +16,7 @@ type
 
   TOnBassRecording = procedure(Sender: TObject; Channel: DWORD; const CurrentTime: Cardinal) of object;
 
-  TCustomBassRecorder = class abstract(TComponent)
+  TCustomBassRecorder = class abstract(TCustomBassComponent)
     type
       TWaveHeader = packed record
         RIFF: array[0..3] of UTF8Char;
@@ -40,13 +41,16 @@ type
     FCurrentTime: Cardinal;
     FStream: TStream;
     FOnRecording: TOnBassRecording;
+    FChannels: Integer;
     function FDoOnRecording(hChannel: HRECORD; Buffer: Pointer; Size: DWord; User: Pointer): Boolean;
     procedure SetOnRecording(const Value: TOnBassRecording);
+    procedure SetChannels(const Value: Integer);
   public
     function GetInputDevices: TList<TInputDevice>;
-    function Init(const Frequency: Cardinal; Device: Integer = -1): Boolean;
+    function Init(Handle: Pointer = nil; HWND: NativeUInt = 0): Boolean; override;
     procedure Start(const Stream: TStream; Device: Integer = -1);
     procedure Stop(const FreeStream: Boolean = True);
+    property Channels: Integer read FChannels write SetChannels;
     property IsRecording: Boolean read FIsRecording;
     property CurrentTime: Cardinal read FCurrentTime;
     constructor Create(AOwner: TComponent); override;
@@ -72,6 +76,7 @@ begin
   inherited;
   FCurrentTime := 0;
   InternalBaseRecorder := Self;
+  FChannels := 2;
 end;
 
 destructor TCustomBassRecorder.Destroy;
@@ -123,10 +128,16 @@ begin
   until BassResult = -1;
 end;
 
-function TCustomBassRecorder.Init(const Frequency: Cardinal; Device: Integer): Boolean;
+function TCustomBassRecorder.Init(Handle: Pointer; HWND: NativeUInt): Boolean;
 begin
-  Result := BASS_Init(Device, Frequency, BASS_DEVICE_LATENCY, 0, nil);
-  BASS_RecordInit(Device);
+  Result := BassLibrary.IsInit or inherited Init(Handle, HWND);
+  if Result then
+    Result := BASS_RecordInit(BassLibrary.Device);
+end;
+
+procedure TCustomBassRecorder.SetChannels(const Value: Integer);
+begin
+  FChannels := Value;
 end;
 
 procedure TCustomBassRecorder.SetOnRecording(const Value: TOnBassRecording);
@@ -137,8 +148,6 @@ end;
 procedure TCustomBassRecorder.Start(const Stream: TStream; Device: Integer);
 const
   PCMHeader = 1;
-  Freq = 44100;
-  Channels = 2;
 var
   WaveHdr: TWaveHeader;
 begin
@@ -156,7 +165,7 @@ begin
     Format := PCMHeader;
     //
     NumChannels := Channels;
-    SamplesPerSecond := Freq;
+    SamplesPerSecond := BassLibrary.Freq;
     BitsPerSample := 16; //8,16,24,32
     //
     BytesPerSec := NumChannels * SamplesPerSecond * (BitsPerSample div 8);
@@ -165,7 +174,7 @@ begin
     DataLen := 0;
   end;
   FStream.Write(WaveHdr, SizeOf(TWaveHeader));
-  FRecordChannel := BASS_RecordStart(Freq, Channels, 0, @RecordingCallback, nil);
+  FRecordChannel := BASS_RecordStart(BassLibrary.Freq, Channels, 0, @RecordingCallback, nil);
 end;
 
 procedure TCustomBassRecorder.Stop(const FreeStream: Boolean);

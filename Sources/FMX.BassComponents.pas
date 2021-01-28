@@ -11,11 +11,9 @@ type
   public
     property Bufferring;
     property BufferringPercent;
-    property IsInit;
     property IsOpening;
     property IsPause;
     property IsPlay;
-    property LastErrorCode;
     property Position;
     property PositionByte;
     property PositionPercent;
@@ -31,17 +29,12 @@ type
     property Async default False;
     property AutoInit default False;
     property Autoplay default False;
-    property Device default -1;
+    property BassLibrary;
     property FileName;
-    property Flags default 0;
-    property Freq default 44100;
     property KeepPlayChannel default False;
     property PauseOnIncomingCalls default False;
     property StreamURL;
-    property Version;
-    property Plugins;
     property PositionInterval default 1000;
-    property UseDefaultDevice default True;
     //Events
     property OnChangeState;
     property OnChangePosition;
@@ -51,6 +44,9 @@ type
   [ComponentPlatformsAttribute(pidWin32 or pidWin64 or pidAndroid32Arm or pidAndroid64Arm)]
   TBassRecorder = class(TCustomBassRecorder)
   published
+    property AutoInit default False;
+    property BassLibrary;
+    property Channels default 2;
     property OnRecording;
   end;
 
